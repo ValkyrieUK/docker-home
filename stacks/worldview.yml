@@ -1,0 +1,144 @@
+version: "3.8"
+
+# WorldView v2 - Multi-site Docker Swarm deployment
+#
+# Deploy from the manager (TrueNAS):
+#   docker stack deploy -c worldview.yml worldview
+#
+# Or remotely from your iMac via Tailscale:
+#   docker -H ssh://root@100.75.214.41 stack deploy -c worldview.yml worldview
+#
+# Scale workers:
+#   docker service scale worldview_correlator-worker=4
+#   docker service scale worldview_anomaly-worker=2
+
+services:
+  # ── Database ──────────────────────────────────────────
+  # Pin to manager (TrueNAS) for fast local storage
+  postgres:
+    image: ghcr.io/valkyrie-uk/worldview-postgres:latest
+    environment:
+      POSTGRES_DB: worldview
+      POSTGRES_USER: worldview
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    secrets:
+      - pg_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U worldview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Cache / PubSub ───────────────────────────────────
+  # Pin to same node as postgres for low-latency pub/sub
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Application Server ───────────────────────────────
+  # Stateless - can run on any node
+  app:
+    image: ghcr.io/valkyrie-uk/worldview-app:latest
+    ports:
+      - "3000:3000"
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: worldview
+      PGUSER: worldview
+      PGPASSWORD_FILE: /run/secrets/pg_password
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      PORT: "3000"
+      HOST: "0.0.0.0"
+    secrets:
+      - pg_password
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    depends_on:
+      - postgres
+      - redis
+
+  # ── Correlator Workers ───────────────────────────────
+  # CPU-bound spatial correlation - spread across nodes
+  correlator-worker:
+    image: ghcr.io/valkyrie-uk/worldview-app:latest
+    command: bun run packages/engine/src/worker-correlator.ts
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: worldview
+      PGUSER: worldview
+      PGPASSWORD_FILE: /run/secrets/pg_password
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    secrets:
+      - pg_password
+    networks:
+      - backend
+    deploy:
+      replicas: 2
+      placement:
+        max_replicas_per_node: 2
+
+  # ── Anomaly Workers ─────────────────────────────────
+  # Spread across nodes for redundancy
+  anomaly-worker:
+    image: ghcr.io/valkyrie-uk/worldview-app:latest
+    command: bun run packages/engine/src/worker-anomaly.ts
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: worldview
+      PGUSER: worldview
+      PGPASSWORD_FILE: /run/secrets/pg_password
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    secrets:
+      - pg_password
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        max_replicas_per_node: 1
+
+networks:
+  backend:
+    driver: overlay
+
+volumes:
+  pgdata:
+  redisdata:
+
+secrets:
+  pg_password:
+    external: true

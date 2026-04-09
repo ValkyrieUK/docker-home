@@ -5,11 +5,14 @@ Multi-site Docker Swarm over Tailscale. Run containers across servers in differe
 ## Architecture
 
 ```
-Manager Node (Site A)              Worker Node (Site B)
-  Tailscale (100.x.x.1)  <------->  Tailscale (100.x.x.2)
-  Docker Swarm Manager               Docker Swarm Worker
-  ├── service-a ◄── overlay net ──► service-b
-  └── service-c                      └── service-d
+iMac (100.104.90.34)
+  └── deploy via: docker -H ssh://root@100.75.214.41
+
+TrueNAS (100.75.214.41)             Ubuntu @ Dad's (100.99.166.30)
+  Swarm Manager                       Swarm Worker
+  ├── postgres                        ├── correlator-worker
+  ├── redis            ◄── overlay ──►├── anomaly-worker
+  └── app (port 3000)                 └── ...
 ```
 
 Tailscale creates an encrypted mesh VPN between all nodes using NAT traversal (DERP relay servers). Docker Swarm runs on top, advertising on Tailscale IPs so all swarm and overlay traffic flows through the tunnel.
@@ -92,22 +95,81 @@ docker node ls
 
 Both nodes should show `Ready` / `Active`.
 
-## Deploying Stacks
+## Deploying WorldView
 
-Deploy from the manager node:
+### 1. Build and push the images
+
+In the WorldView repo, build and push to GitHub Container Registry:
 
 ```bash
-docker stack deploy -c stacks/example-stack.yml myapp
+# Login to GHCR
+echo $GITHUB_TOKEN | docker login ghcr.io -u ValkyrieUK --password-stdin
+
+# Build and push the app image
+docker build -f docker/Dockerfile.app -t ghcr.io/valkyrie-uk/worldview-app:latest .
+docker push ghcr.io/valkyrie-uk/worldview-app:latest
+
+# Build and push the postgres image
+docker build -f docker/Dockerfile.postgres -t ghcr.io/valkyrie-uk/worldview-postgres:latest .
+docker push ghcr.io/valkyrie-uk/worldview-postgres:latest
 ```
+
+### 2. Create the secret
+
+On the swarm manager (TrueNAS):
+
+```bash
+echo "your-db-password" | docker secret create pg_password -
+```
+
+### 3. Deploy the stack
+
+From TrueNAS:
+```bash
+docker stack deploy -c stacks/worldview.yml worldview
+```
+
+Or remotely from your iMac via Tailscale:
+```bash
+docker -H ssh://root@100.75.214.41 stack deploy -c stacks/worldview.yml worldview
+```
+
+### 4. Check status
+
+```bash
+docker stack ps worldview
+docker service ls
+```
+
+### 5. Scale workers
+
+```bash
+docker service scale worldview_correlator-worker=4
+docker service scale worldview_anomaly-worker=2
+```
+
+### Service placement
+
+| Service | Node | Why |
+|---------|------|-----|
+| postgres | TrueNAS (manager) | Needs fast local storage for persistent volumes |
+| redis | TrueNAS (manager) | Co-located with postgres for low-latency pub/sub |
+| app | TrueNAS (manager) | Close to database, serves the WebSocket API |
+| correlator-worker | Any node | CPU-bound, stateless - spread across nodes |
+| anomaly-worker | Any node | CPU-bound, stateless - spread across nodes |
+
+Workers are the ideal candidates for running on the Ubuntu server at dad's since they're stateless and only need network access to postgres and redis over the overlay.
+
+## Deploying Other Stacks
 
 Services on the overlay network can reach each other by service name regardless of which physical node they run on.
 
 ### Remote deploy from your workstation
 
-With Tailscale on your workstation, you can deploy directly:
+With Tailscale on your iMac, deploy directly:
 
 ```bash
-docker -H ssh://user@<manager-tailscale-ip> stack deploy -c stacks/example-stack.yml myapp
+docker -H ssh://root@100.75.214.41 stack deploy -c stacks/my-stack.yml myapp
 ```
 
 ## Project Structure
@@ -120,7 +182,7 @@ bismarck/
 │   ├── join-worker.sh       # Join an existing swarm as worker
 │   └── setup-worker.sh      # Bootstrap a fresh Ubuntu server
 └── stacks/
-    └── example-stack.yml    # Example multi-host stack
+    └── worldview.yml        # WorldView multi-site stack
 ```
 
 ## Adding a New Stack
